@@ -1,0 +1,6 @@
+{
+    "recommendations": [
+        "ms-iot.vscode-ros",
+        "ranch-hand-robotics.rde-ros-2"
+    ]
+}
