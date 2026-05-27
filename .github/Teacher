@@ -1,0 +1,696 @@
+```react
+import React, { useState, useMemo } from 'react';
+
+// 預設模擬個案與核銷資料
+const INITIAL_RECORDS = [
+  { id: 'r1', date: '2026-05-02', purpose: '就醫', type: '來回', origin: '個案家', destination: '臺大醫院', distance: 12, companion: false, note: '定期回診' },
+  { id: 'r2', date: '2026-05-10', purpose: '復健', type: '單程', origin: '個案家', destination: '榮民總醫院', distance: 22, companion: true, note: '復健治療，有一位陪同者' },
+  { id: 'r3', date: '2026-05-15', purpose: '就醫', type: '來回', origin: '個案家', destination: '三軍總醫院', distance: 28, companion: false, note: '里程數較遠' },
+  { id: 'r4', date: '2026-05-18', purpose: '洗腎', type: '單程', origin: '個案家', destination: '信義診所', distance: 8, companion: false, note: '' },
+];
+
+export default function App() {
+  // 個案基本設定
+  const [caseName, setCaseName] = useState('陳大公');
+  const [identityType, setIdentityType] = useState('一般戶'); // 一般戶, 中低收入戶, 低收入戶
+  const [areaType, setAreaType] = useState('一般地區'); // 一般地區, 偏遠地區
+  
+  // 系統明細紀錄
+  const [records, setRecords] = useState(INITIAL_RECORDS);
+
+  // 表單輸入狀態
+  const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
+  const [purpose, setPurpose] = useState('就醫');
+  const [type, setType] = useState('單程'); // 單程, 來回
+  const [origin, setOrigin] = useState('');
+  const [destination, setDestination] = useState('');
+  const [distance, setDistance] = useState(10);
+  const [companion, setCompanion] = useState(false);
+  const [note, setNote] = useState('');
+
+  // 當前地區與身分的費率規則
+  const rules = useMemo(() => {
+    // 自付額比例 (一般戶 21%, 中低收入 7%, 低收入 0%)
+    let coPayRate = 0.21;
+    if (identityType === '中低收入戶') coPayRate = 0.07;
+    if (identityType === '低收入戶') coPayRate = 0;
+
+    // 地區設定 (一趟基礎車資, 里程上限)
+    let basePrice = 250;
+    let maxFreeDistance = 20;
+    
+    if (areaType === '偏遠地區') {
+      basePrice = 300;
+      maxFreeDistance = 25;
+    }
+
+    return { coPayRate, basePrice, maxFreeDistance };
+  }, [identityType, areaType]);
+
+  // 每月最大補助趟數上限為 8 趟
+  const MAX_SUBSIDY_TRIPS = 8;
+
+  // 計算所有趟次拆解（包含累計趟數、政府補助、民眾自負）
+  const analyzedRecords = useMemo(() => {
+    let accumulatedTrips = 0;
+
+    return records.map((record) => {
+      // 判斷這一筆紀錄佔用幾趟 (單程=1趟, 來回=2趟)
+      const currentTripCount = record.type === '來回' ? 2 : 1;
+      
+      let subsidyTripsThisRecord = 0; // 此筆紀錄中，可享有補助的趟數
+      let selfPayTripsThisRecord = 0; // 此筆紀錄中，超出補助上限（自費）的趟數
+
+      // 依序分配補助額度
+      for (let i = 0; i < currentTripCount; i++) {
+        if (accumulatedTrips < MAX_SUBSIDY_TRIPS) {
+          subsidyTripsThisRecord++;
+        } else {
+          selfPayTripsThisRecord++;
+        }
+        accumulatedTrips++;
+      }
+
+      // 里程計算 (以單趟為單位計算。如果是來回，里程會套用兩次計算)
+      const overDistancePerTrip = Math.max(0, record.distance - rules.maxFreeDistance);
+      const overDistanceCostPerTrip = overDistancePerTrip * 10; // $10/km
+
+      // 1. 補助額度內的車資計算
+      const subsidyBaseCost = subsidyTripsThisRecord * rules.basePrice;
+      const coPayInLimit = Math.round(subsidyBaseCost * rules.coPayRate); // 自付額部分
+      const govSubsidy = subsidyBaseCost - coPayInLimit; // 政府補助部分
+
+      // 2. 超出 8 趟限制的車資計算 (全額自費)
+      const outOfLimitCost = selfPayTripsThisRecord * rules.basePrice;
+
+      // 3. 超里程自費額 (不論是否在補助趟數內，超過的里程皆為自費，來回程若都超里程則 * 2)
+      const totalOverDistanceCost = overDistanceCostPerTrip * currentTripCount;
+
+      // 4. 陪同者自費費用 (假設陪同者每趟自費 $50 作為示範規則，可自行調整)
+      const companionCost = record.companion ? (50 * currentTripCount) : 0;
+
+      // 彙整此筆紀錄的金額
+      const totalCost = (currentTripCount * rules.basePrice) + totalOverDistanceCost + companionCost;
+      const clientTotalPay = coPayInLimit + outOfLimitCost + totalOverDistanceCost + companionCost;
+
+      return {
+        ...record,
+        tripCount: currentTripCount,
+        subsidyTrips: subsidyTripsThisRecord,
+        selfPayTrips: selfPayTripsThisRecord,
+        overDistanceCost: totalOverDistanceCost,
+        companionCost,
+        govSubsidy,
+        coPayInLimit,
+        outOfLimitCost,
+        clientTotalPay,
+        totalCost,
+        isOverLimit: selfPayTripsThisRecord > 0
+      };
+    });
+  }, [records, rules]);
+
+  // 計算經費總計指標
+  const summary = useMemo(() => {
+    let totalGov = 0;
+    let totalClientCoPay = 0; // 額度內部分負擔
+    let totalClientOverDistance = 0; // 超里程自費
+    let totalClientOverLimit = 0; // 超出8趟自費
+    let totalClientCompanion = 0; // 陪同自費
+    let totalTrips = 0;
+
+    analyzedRecords.forEach(r => {
+      totalGov += r.govSubsidy;
+      totalClientCoPay += r.coPayInLimit;
+      totalClientOverDistance += r.overDistanceCost;
+      totalClientOverLimit += r.outOfLimitCost;
+      totalClientCompanion += r.companionCost;
+      totalTrips += r.tripCount;
+    });
+
+    const totalClientPay = totalClientCoPay + totalClientOverDistance + totalClientOverLimit + totalClientCompanion;
+    const grandTotal = totalGov + totalClientPay;
+
+    return {
+      totalGov,
+      totalClientCoPay,
+      totalClientOverDistance,
+      totalClientOverLimit,
+      totalClientCompanion,
+      totalClientPay,
+      grandTotal,
+      totalTrips
+    };
+  }, [analyzedRecords]);
+
+  // 新增乘車紀錄
+  const handleAddRecord = (e) => {
+    e.preventDefault();
+    if (!origin || !destination) {
+      alert('請輸入起點與終點名稱！');
+      return;
+    }
+
+    const newRecord = {
+      id: Date.now().toString(),
+      date,
+      purpose,
+      type,
+      origin,
+      destination,
+      distance: parseFloat(distance),
+      companion,
+      note
+    };
+
+    setRecords([...records, newRecord]);
+    // 部分重置
+    setOrigin('');
+    setDestination('');
+    setNote('');
+  };
+
+  // 刪除乘車紀錄
+  const handleDelete = (id) => {
+    setRecords(records.filter(r => r.id !== id));
+  };
+
+  return (
+    
+
+      
+
+        
+        {/* 頁首 */}
+        
+          
+
+            
+
+              🚗 DA01 交通接送經費核銷系統            
+
+            
+
+              符合「長照 2.0」支付與給付標準，自動計算公家補助、自付比例、超里程與超趟自費            
+          
+
+          
+
+            本月補助上限：{MAX_SUBSIDY_TRIPS} 趟          
+
+        
+
+        {/* 兩欄配置 */}
+        
+
+          
+          {/* 左側：個案政策設定與輸入表單 */}
+          
+
+            
+            {/* 個案屬性設定 */}
+            
+
+              
+
+                👤 個案基本政策設定              
+
+              
+              
+
+                
+
+                  個案姓名
+                                      type="text"
+                    value={caseName}
+                    onChange={(e) => setCaseName(e.target.value)}
+                    className="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 transition text-sm"
+                  />                
+
+
+                
+
+                  福利身分類別 (影響自付額比例)
+                  
+
+                    {[
+                      { key: '一般戶', label: '一般戶 (21%)' },
+                      { key: '中低收入戶', label: '中低戶 (7%)' },
+                      { key: '低收入戶', label: '低收戶 (0%)' }
+                    ].map(item => (
+                                              key={item.key}
+                        type="button"
+                        onClick={() => setIdentityType(item.key)}
+                        className={`py-1.5 text-xs font-medium rounded-lg border transition ${
+                          identityType === item.key
+                            ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
+                            : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                        }`}
+                      >
+                        {item.label}
+                      
+                    ))}                  
+                
+
+
+                
+
+                  居住地區類別 (影響單趟計價與里程限制)
+                  
+
+                    {[
+                      { key: '一般地區', label: '一般地區 ($250 / 20km)' },
+                      { key: '偏遠地區', label: '偏遠地區 ($300 / 25km)' }
+                    ].map(item => (
+                                              key={item.key}
+                        type="button"
+                        onClick={() => setAreaType(item.key)}
+                        className={`py-1.5 text-xs font-medium rounded-lg border transition ${
+                          areaType === item.key
+                            ? 'bg-emerald-600 text-white border-emerald-600 shadow-sm'
+                            : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                        }`}
+                      >
+                        {item.label}
+                      
+                    ))}                  
+                
+              
+            
+
+
+            {/* 新增乘車紀錄表單 */}
+            
+
+              
+
+                ➕ 新增乘車紀錄              
+
+
+              
+                
+
+                  
+
+                    乘車日期
+                                          type="date"
+                      required
+                      value={date}
+                      onChange={(e) => setDate(e.target.value)}
+                      className="w-full px-2 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500"
+                    />                  
+
+                  
+
+                    乘車目的
+                                          value={purpose}
+                      onChange={(e) => setPurpose(e.target.value)}
+                      className="w-full px-2 py-1.5 border border-slate-200 rounded-lg text-xs bg-white focus:ring-2 focus:ring-indigo-500"
+                    >
+                      就醫門診 🏥
+                      復健治療 🏃
+                      透析洗腎 💧
+                                      
+                
+
+
+                
+
+                  
+
+                    行程種類
+                    
+
+                                              type="button"
+                        onClick={() => setType('單程')}
+                        className={`flex-1 text-center py-1 rounded text-xs transition ${
+                          type === '單程' ? 'bg-white font-bold shadow-sm text-slate-900' : 'text-slate-500'
+                        }`}
+                      >
+                        單程 (1 趟)
+                      
+                                              type="button"
+                        onClick={() => setType('來回')}
+                        className={`flex-1 text-center py-1 rounded text-xs transition ${
+                          type === '來回' ? 'bg-white font-bold shadow-sm text-slate-900' : 'text-slate-500'
+                        }`}
+                      >
+                        來回 (2 趟)
+                                          
+                  
+
+                  
+
+                    單趟里程數 (km)
+                                          type="number"
+                      min="1"
+                      required
+                      value={distance}
+                      onChange={(e) => setDistance(parseFloat(e.target.value))}
+                      className="w-full px-2 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500"
+                    />                  
+                
+
+
+                
+
+                  
+
+                    乘車起點
+                                          type="text"
+                      required
+                      placeholder="例：個案家"
+                      value={origin}
+                      onChange={(e) => setOrigin(e.target.value)}
+                      className="w-full px-2 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500"
+                    />                  
+
+                  
+
+                    乘車終點
+                                          type="text"
+                      required
+                      placeholder="例：耕莘醫院"
+                      value={destination}
+                      onChange={(e) => setDestination(e.target.value)}
+                      className="w-full px-2 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500"
+                    />                  
+                
+
+
+                
+
+                                      type="checkbox"
+                    id="companion"
+                    checked={companion}
+                    onChange={(e) => setCompanion(e.target.checked)}
+                    className="h-4 w-4 text-indigo-600 border-slate-300 rounded focus:ring-indigo-500"
+                  />
+                  
+                    有陪同者搭乘 (每單趟另計 $50)
+                                  
+
+
+                
+
+                  備註說明 (選填)
+                                      type="text"
+                    placeholder="補充說明..."
+                    value={note}
+                    onChange={(e) => setNote(e.target.value)}
+                    className="w-full px-2 py-1.5 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500"
+                  />                
+
+
+                                  type="submit"
+                  className="w-full py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-medium rounded-lg shadow-sm text-sm transition"
+                >
+                  新增至核銷清單 📝
+                
+                          
+
+          
+
+
+          {/* 右側：金額統計看板與明細總表 */}
+          
+
+            
+            {/* 核心金額拆解看板 */}
+            
+
+              
+
+                📊 實時核銷經費看板 (當月累計趟數: {summary.totalTrips} / 8 趟)              
+
+              
+              
+
+                
+
+                  1. 政府經費補助
+                  
+                    ${summary.totalGov.toLocaleString()}
+                  
+                  補助率 {Math.round((1 - rules.coPayRate) * 100)}%                
+
+
+                
+
+                  2. 額度內部分負擔
+                  
+                    ${summary.totalClientCoPay.toLocaleString()}
+                  
+                  自付額率 {Math.round(rules.coPayRate * 100)}%                
+
+
+                
+
+                  3. 超里程自費額
+                  
+                    ${summary.totalClientOverDistance.toLocaleString()}
+                  
+                  超過 {rules.maxFreeDistance}km 計 $10/km                
+
+
+                
+
+                  4. 超額與陪同自費
+                  
+                    ${(summary.totalClientOverLimit + summary.totalClientCompanion).toLocaleString()}
+                  
+                  超過 8 趟或加收陪同                
+              
+
+
+              {/* 實付對帳小結 */}
+              
+
+                
+
+                  車資總花費: ${summary.grandTotal.toLocaleString()}                
+
+                
+
+                  
+
+                    民眾實付總額 (2 + 3 + 4)
+                    
+                      ${summary.totalClientPay.toLocaleString()}
+                                      
+                
+              
+            
+
+
+            {/* 乘車核銷明細清單 */}
+            
+
+              
+
+                
+
+                  
+DA01 乘車核銷總表 (個案: {caseName})
+
+                  
+系統將由舊至新依序核算 8 趟補助配額
+                
+
+                
+                  共 {records.length} 筆
+                              
+
+
+              {analyzedRecords.length === 0 ? (
+                
+
+                  
+🚗
+
+                  
+尚未登錄任何乘車紀錄，請由左側填報
+                
+
+              ) : (
+                
+
+                  
+                    
+                      
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                      
+                    
+                    
+                      {(() => {
+                        let runningTripTotal = 0;
+                        return analyzedRecords.map((record) => {
+                          const prevStartTrip = runningTripTotal + 1;
+                          runningTripTotal += record.tripCount;
+                          const currentTripRange = record.type === '來回'
+                            ? `${prevStartTrip} - ${runningTripTotal}`
+                            : `${prevStartTrip}`;
+
+                          return (
+                            record.id} className="hover:bg-slate-50/50 transition-colors">
+                              {/* 趟序及日期 */}
+                              
+
+                              {/* 路線與目的 */}
+                              
+
+                              {/* 里程 */}
+                              
+
+                              {/* 政府補助 */}
+                              
+
+                              {/* 民眾額度內自付 */}
+                              
+
+                              {/* 額外自費細項 */}
+                              
+
+                              {/* 此筆民眾實付總額 */}
+                              
+
+                              {/* 刪除按鈕 */}
+                              
+                            
+                          );
+                        });
+                      })()}
+                    
+                  
+趟序 / 日期
+路線
+單趟里程
+政府補助
+民眾自付
+自費細項
+此筆實付
+操作
+
+                                
+
+                                                                      record.isOverLimit
+                                      ? 'bg-rose-100 text-rose-800'
+                                      : 'bg-indigo-100 text-indigo-800'
+                                  }`}>
+                                    #{currentTripRange} 趟
+                                  
+                                  {record.isOverLimit && (
+                                    
+                                      超額自費
+                                    
+                                  )}                                
+
+                                
+{record.date}
+                              
+
+                                
+
+                                  
+                                    {record.purpose}
+                                  
+                                  ({record.type})                                
+
+                                
+
+                                  {record.origin} ➔ {record.destination}                                
+
+                                {record.note && (
+                                  
+{record.note}
+
+                                )}                              
+
+                                
+{record.distance} km
+
+                                {record.distance > rules.maxFreeDistance ? (
+                                  
+
+                                    超里程 {Math.round((record.distance - rules.maxFreeDistance) * 10) / 10}km                                  
+
+                                ) : (
+                                  
+額度內
+
+                                )}                              
+
+                                ${record.govSubsidy.toLocaleString()}                              
+
+                                ${record.coPayInLimit.toLocaleString()}                              
+
+                                
+
+                                  {record.overDistanceCost > 0 && (
+                                    
+路程自費: ${record.overDistanceCost}
+
+                                  )}
+                                  {record.outOfLimitCost > 0 && (
+                                    
+超限自費: ${record.outOfLimitCost}
+
+                                  )}
+                                  {record.companionCost > 0 && (
+                                    
+陪同自費: ${record.companionCost}
+
+                                  )}
+                                  {record.overDistanceCost === 0 && record.outOfLimitCost === 0 && record.companionCost === 0 && (
+                                    -
+                                  )}                                
+                              
+
+                                ${record.clientTotalPay.toLocaleString()}                              
+
+                                                                  onClick={() => handleDelete(record.id)}
+                                  className="text-[10px] bg-slate-100 hover:bg-rose-50 text-slate-400 hover:text-rose-600 p-1 rounded transition"
+                                >
+                                  刪除
+                                                              
+                
+
+              )}            
+
+
+            {/* 核銷報表聲明與指南 */}
+            
+
+              
+
+                💡 交通接送核銷作業說明：              
+
+              
+                 
+	•	                   DA01 額度說明：長照需要等級為 2 級以上之個案可申請。依申報先後順序，每月前 8 趟可享有政府比率補助。                
+                 
+	•	                   來回行程扣抵：一筆「來回」行程將自動佔用 2 趟補助額度。當累計補助趟數達到 8 趟上限時，後續行程之基準車資將改為民眾全額自費。                
+                 
+	•	                   超里程計算 formula：每單趟超過該地區免费里程上限（一般地區 20km、偏遠地區 25km）之里程，將以每一公里加收 $10 額外自費額計，本項目不納入比例補助。                
+                          
+
+          
+
+        
+
+      
+    
+
+  );
+}
+
+```
+
+
